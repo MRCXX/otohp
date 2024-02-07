@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>otohp</title>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.0/full/pyodide.js"></script>
+</head>
+
+<body>
+    <h1>photo stacking</h1>
+    <input type="file" id="inputElement" multiple />
+    <script>
+
+        let inputElement = document.getElementById("inputElement");
+        inputElement.addEventListener("change", handleFiles, false);
+
+        function readFile(file) {
+            return new Promise((resolve, reject) => {
+                let reader = new FileReader();
+                reader.onload = event => resolve(event.target.result);
+                reader.onerror = error => reject(error);
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        async function handleFiles() {
+            let fileList = this.files;
+            const res = [];
+            for (let file of Array.from(fileList)) {
+                try {
+                    let buffer = await readFile(file);
+                    // console.log('buffer', buffer);
+                    // 在这里，buffer是一个包含了文件原始字节的ArrayBuffer。
+                    // 你可以将这个ArrayBuffer传递给你的Python代码。
+                    res.push(buffer)
+                } catch (error) {
+                    console.error('Error reading file:', error);
+                }
+            }
+            pyodide.globals.set("file_list", res);
+            pyodide.runPython(code)
+        }
+    </script>
+
+    <script>
+        const code = `
+        import os
+        import cv2
+        import numpy as np
+        import io
+        from time import time
+        import js
+        import base64
+        
+        # Align and stack images by matching ORB keypoints
+        # Faster but less accurate
+        def stackImagesKeypointMatching(file_list):
+        
+            orb = cv2.ORB_create()
+        
+            # disable OpenCL to because of bug in ORB in OpenCV 3.1
+            cv2.ocl.setUseOpenCL(False)
+        
+            stacked_image = None
+            first_image = None
+            first_kp = None
+            first_des = None
+            for file in file_list:
+                # image = cv2.imread(file,1)
+                file1 = file.to_py()
+                byte_stream = io.BytesIO(file1)
+                image = cv2.imdecode(np.frombuffer(byte_stream.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+        
+                imageF = image.astype(np.float32) / 255
+        
+                # compute the descriptors with ORB
+                kp = orb.detect(image, None)
+                kp, des = orb.compute(image, kp)
+        
+                # create BFMatcher object
+                matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        
+                if first_image is None:
+                    # Save keypoints for first image
+                    stacked_image = imageF
+                    first_image = image
+                    first_kp = kp
+                    first_des = des
+                else:
+                     # Find matches and sort them in the order of their distance
+                    matches = matcher.match(first_des, des)
+                    matches = sorted(matches, key=lambda x: x.distance)
+        
+                    src_pts = np.float32(
+                        [first_kp[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32(
+                        [kp[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        
+                    # Estimate perspective transformation
+                    M, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 5.0)
+                    w, h, _ = imageF.shape
+                    imageF = cv2.warpPerspective(imageF, M, (h, w))
+                    stacked_image += imageF
+        
+            stacked_image /= len(file_list)
+            stacked_image = (stacked_image*255).astype(np.uint8)
+            return stacked_image
+        
+        def image_to_data_url(image):
+            # 将图像转换为JPEG格式
+            retval, buffer = cv2.imencode('.jpg', image)
+            # 将JPEG图像转换为base64编码
+            jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+            # 创建一个DataURL
+            data_url = f'data:image/jpeg;base64,{jpg_as_text}'
+            return data_url
+        
+        if __name__ == '__main__':
+            # file_list = os.listdir('images/')
+            # file_list = [os.path.join('images/', x)
+            # for x in file_list if x.endswith(('.jpg', '.png','.bmp'))]
+            description = "Stacking images using ORB method"
+            print(description)
+            stacked_image = stackImagesKeypointMatching(file_list)
+            
+            div = js.document.createElement("div")
+            div.innerHTML = '<img src="' + image_to_data_url(stacked_image) + '"/>'
+            js.document.body.prepend(div)
+            print('done')
+            # print("Saved {}".format('result.jpg'))
+            # cv2.imwrite(str('result.jpg'),stacked_image)
+        `
+
+        async function main() {
+            window.pyodide = await loadPyodide()
+            await pyodide.loadPackage('micropip')
+            const micropip = pyodide.pyimport('micropip')
+            await micropip.install('opencv-python')
+        }
+        main()
+    </script>
+</body>
+
+</html>
